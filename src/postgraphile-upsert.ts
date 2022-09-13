@@ -28,17 +28,20 @@ const determineUpsertConstraint = ({
   const inputData: Record<string, unknown> = input[inflection.tableFieldName(table)];  
    // Figure out which columns the unique constraints belong to
    const columnsByConstraintName = constraints.reduce<{
-    [key: string]: Set<Attribute>;
+    [key: string]: { constraint; columns: Set<Attribute> };
   }>(
     (acc, constraint) => ({
       ...acc,
-      [constraint.name]: new Set(
+      [constraint.name]: {
+        constraint,
+        columns: new Set(
         constraint.keyAttributeNums.map((num) => {
           const match = attributes.find((attr) => attr.num === num);
           assert(match, `no attribute found for ${num}`);
           return match;
         })
-      ),
+      )
+      },
     }),
     {}
   );
@@ -88,15 +91,15 @@ const determineUpsertConstraint = ({
    */
   const matchingConstraint =
       (where
-        ? Object.entries(columnsByConstraintName).find(([, columns]) =>
+        ? Object.entries(columnsByConstraintName).find(([, { columns }]) =>
             [...columns].every(
               (col) => inflection.camelCase(col.name) in where
             )
           )
-        : Object.entries(columnsByConstraintName).find(([, columns]) =>
+        : Object.entries(columnsByConstraintName).find(([, { columns }]) =>
             [...columns].every((col) => inputDataColumns.has(col.name))
           )) ??
-      Object.entries(columnsByConstraintName).find(([, columns]) =>
+      Object.entries(columnsByConstraintName).find(([, { columns }]) =>
         [...columns].every((col) =>
           inputDataColumnsWithDefaults.has(col.name)
         )
@@ -112,7 +115,7 @@ const determineUpsertConstraint = ({
         ].join(", ")}`
       );
     }
-  const [name, constraint] = matchingConstraint
+  const [name, { constraint }] = matchingConstraint
 
   return {
     name,

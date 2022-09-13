@@ -10,11 +10,14 @@ const determineUpsertConstraint = ({ table, args: { input, where }, constraints,
     // Figure out which columns the unique constraints belong to
     const columnsByConstraintName = constraints.reduce((acc, constraint) => ({
         ...acc,
-        [constraint.name]: new Set(constraint.keyAttributeNums.map((num) => {
-            const match = attributes.find((attr) => attr.num === num);
-            (0, assert_1.default)(match, `no attribute found for ${num}`);
-            return match;
-        })),
+        [constraint.name]: {
+            constraint,
+            columns: new Set(constraint.keyAttributeNums.map((num) => {
+                const match = attributes.find((attr) => attr.num === num);
+                (0, assert_1.default)(match, `no attribute found for ${num}`);
+                return match;
+            }))
+        },
     }), {});
     const fieldToAttributeMap = attributes.reduce((acc, attr) => ({
         ...acc,
@@ -44,16 +47,16 @@ const determineUpsertConstraint = ({ table, args: { input, where }, constraints,
      * 4. else, use the primary key constraint if it exists
      */
     const matchingConstraint = (where
-        ? Object.entries(columnsByConstraintName).find(([, columns]) => [...columns].every((col) => inflection.camelCase(col.name) in where))
-        : Object.entries(columnsByConstraintName).find(([, columns]) => [...columns].every((col) => inputDataColumns.has(col.name)))) ??
-        Object.entries(columnsByConstraintName).find(([, columns]) => [...columns].every((col) => inputDataColumnsWithDefaults.has(col.name))) ??
+        ? Object.entries(columnsByConstraintName).find(([, { columns }]) => [...columns].every((col) => inflection.camelCase(col.name) in where))
+        : Object.entries(columnsByConstraintName).find(([, { columns }]) => [...columns].every((col) => inputDataColumns.has(col.name)))) ??
+        Object.entries(columnsByConstraintName).find(([, { columns }]) => [...columns].every((col) => inputDataColumnsWithDefaults.has(col.name))) ??
         Object.entries(columnsByConstraintName).find(([key]) => key === primaryKeyConstraint?.name);
     if (!matchingConstraint) {
         throw new Error(`Unable to determine upsert unique constraint for given upserted columns: ${[
             ...inputDataKeys,
         ].join(", ")}`);
     }
-    const [name, constraint] = matchingConstraint;
+    const [name, { constraint }] = matchingConstraint;
     return {
         name,
         constraint
