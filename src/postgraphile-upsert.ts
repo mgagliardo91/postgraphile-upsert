@@ -9,6 +9,117 @@ import assert from "assert";
 
 type Primitive = string | number | null;
 
+const determineUpsertConstraint = ({
+  table,
+  args: { input, where },
+  constraints,
+  attributes,
+  inflection
+}: {
+  table: PgTable,
+  args: {
+    input: Record<string, Record<string, Primitive>>,
+    where: Record<string, unknown>
+  }
+  constraints: Constraint[],
+  attributes: Attribute[],
+  inflection: any
+}) => {
+  const inputData: Record<string, unknown> = input[inflection.tableFieldName(table)];  
+   // Figure out which columns the unique constraints belong to
+   const columnsByConstraintName = constraints.reduce<{
+    [key: string]: Set<Attribute>;
+  }>(
+    (acc, constraint) => ({
+      ...acc,
+      [constraint.name]: new Set(
+        constraint.keyAttributeNums.map((num) => {
+          const match = attributes.find((attr) => attr.num === num);
+          assert(match, `no attribute found for ${num}`);
+          return match;
+        })
+      ),
+    }),
+    {}
+  );
+
+  const fieldToAttributeMap = attributes.reduce(
+    (acc, attr) => ({
+      ...acc,
+      [inflection.camelCase(attr.name)]: attr,
+    }),
+    {}
+  );
+
+  // Pre-process our primary key constraint
+  const primaryKeyConstraint = constraints.find(
+    (con) => con.type === "p"
+  );
+  const primaryKeyConstraintCols = new Set(
+    primaryKeyConstraint?.keyAttributes.map(({ name }) => name) ?? []
+  );
+
+            
+  // Pre-process our data inputs from the payload (what was manually passed in)
+  const inputDataKeys = new Set(Object.keys(inputData));
+  const inputDataColumns = new Set(
+    [...inputDataKeys].map((key) => fieldToAttributeMap[key].name)
+  );
+  
+  // Construct a super-set of fields passed up plus columns with default values
+  // (as these can be set before the constraint kicks into place)
+  const inputDataColumnsWithDefaults = new Set([
+    ...inputDataColumns,
+    ...attributes
+      .filter(
+        (a) => a.hasDefault && !primaryKeyConstraintCols.has(a.name)
+      )
+      .map(({ name }) => name),
+  ]);
+
+  /**
+   * Depending on whether a where clause was passed, we want to determine which
+   * constraint to use in the upsert ON CONFLICT cause.
+   * Decision flow:
+   * 1. if we have a where clause, attempt to find matching constraint
+   * 2. attempt to find a matching constraint given our data input
+   * 3. attempt to find a matching constraint given our data input + defaulted columns
+   * 4. else, use the primary key constraint if it exists
+   */
+  const matchingConstraint =
+      (where
+        ? Object.entries(columnsByConstraintName).find(([, columns]) =>
+            [...columns].every(
+              (col) => inflection.camelCase(col.name) in where
+            )
+          )
+        : Object.entries(columnsByConstraintName).find(([, columns]) =>
+            [...columns].every((col) => inputDataColumns.has(col.name))
+          )) ??
+      Object.entries(columnsByConstraintName).find(([, columns]) =>
+        [...columns].every((col) =>
+          inputDataColumnsWithDefaults.has(col.name)
+        )
+      ) ??
+      Object.entries(columnsByConstraintName).find(
+        ([key]) => key === primaryKeyConstraint?.name
+      );
+
+    if (!matchingConstraint) {
+      throw new Error(
+        `Unable to determine upsert unique constraint for given upserted columns: ${[
+          ...inputDataKeys,
+        ].join(", ")}`
+      );
+    }
+  const [name, constraint] = matchingConstraint
+
+  return {
+    name,
+    constraint
+  }
+}
+
 export const PgMutationUpsertPlugin: Plugin = (builder) => {
   builder.hook("GraphQLObjectType:fields", (fields, build, context) => {
     const {
@@ -257,13 +368,20 @@ function createUpsertField({
             const sqlColumns: { names: string[] }[] = [];
             const conflictOnlyColumns: { names: string[] }[] = [];
             const sqlValues: unknown[] = [];
+            const matchingConstraint = determineUpsertConstraint({
+              table,
+              args: { where: whereRaw, input },
+              constraints: allUniqueConstraints.filter(
+                (con) => con.classId === table.id
+              ),
+              attributes: pgIntrospectionResultsByKind.attribute.filter(
+                (attr) => attr.classId === table.id
+              ),
+              inflection,
+            })
+
             const inputData: Record<string, unknown> =
               input[inflection.tableFieldName(table)];
-
-            // Find the unique constraints
-            const uniqueConstraints = allUniqueConstraints.filter(
-              (con) => con.classId === table.id
-            );
 
             // Store attributes (columns) for easy access
             const attributes: Attribute[] =
@@ -271,94 +389,9 @@ function createUpsertField({
                 (attr) => attr.classId === table.id
               );
 
-            // Figure out which columns the unique constraints belong to
-            const columnsByConstraintName = uniqueConstraints.reduce<{
-              [key: string]: Set<Attribute>;
-            }>(
-              (acc, constraint) => ({
-                ...acc,
-                [constraint.name]: new Set(
-                  constraint.keyAttributeNums.map((num) => {
-                    const match = attributes.find((attr) => attr.num === num);
-                    assert(match, `no attribute found for ${num}`);
-                    return match;
-                  })
-                ),
-              }),
-              {}
-            );
-
-            const fieldToAttributeMap = attributes.reduce(
-              (acc, attr) => ({
-                ...acc,
-                [inflection.camelCase(attr.name)]: attr,
-              }),
-              {}
-            );
-
-            // Pre-process our primary key constraint
-            const primaryKeyConstraint = uniqueConstraints.find(
-              (con) => con.type === "p"
-            );
-            const primaryKeyConstraintCols = new Set(
-              primaryKeyConstraint?.keyAttributes.map(({ name }) => name) ?? []
-            );
-
-            // Pre-process our data inputs from the payload (what was manually passed in)
-            const inputDataKeys = new Set(Object.keys(inputData));
-            const inputDataColumns = new Set(
-              [...inputDataKeys].map((key) => fieldToAttributeMap[key].name)
-            );
-
-            // Construct a super-set of fields passed up plus columns with default values
-            // (as these can be set before the constraint kicks into place)
-            const inputDataColumnsWithDefaults = new Set([
-              ...inputDataColumns,
-              ...attributes
-                .filter(
-                  (a) => a.hasDefault && !primaryKeyConstraintCols.has(a.name)
-                )
-                .map(({ name }) => name),
-            ]);
-
-            /**
-             * Depending on whether a where clause was passed, we want to determine which
-             * constraint to use in the upsert ON CONFLICT cause.
-             * Decision flow:
-             * 1. if we have a where clause, attempt to find matching constraint
-             * 2. attempt to find a matching constraint given our data input
-             * 3. attempt to find a matching constraint given our data input + defaulted columns
-             * 4. else, use the primary key constraint if it exists
-             */
-            const matchingConstraint =
-              (where
-                ? Object.entries(columnsByConstraintName).find(([, columns]) =>
-                    [...columns].every(
-                      (col) => inflection.camelCase(col.name) in where
-                    )
-                  )
-                : Object.entries(columnsByConstraintName).find(([, columns]) =>
-                    [...columns].every((col) => inputDataColumns.has(col.name))
-                  )) ??
-              Object.entries(columnsByConstraintName).find(([, columns]) =>
-                [...columns].every((col) =>
-                  inputDataColumnsWithDefaults.has(col.name)
-                )
-              ) ??
-              Object.entries(columnsByConstraintName).find(
-                ([key]) => key === primaryKeyConstraint?.name
-              );
-
-            if (!matchingConstraint) {
-              throw new Error(
-                `Unable to determine upsert unique constraint for given upserted columns: ${[
-                  ...inputDataKeys,
-                ].join(", ")}`
-              );
-            }
             assert(table.namespace, "expected table namespace");
 
-            const [constraintName] = matchingConstraint;
+            const { name: constraintName } = matchingConstraint;
             const columnNamesSkippingUpdate = new Set<string>();
 
             // Loop thru columns and "SQLify" them
@@ -449,6 +482,7 @@ function createUpsertField({
         pgFieldIntrospection: table,
         isPgCreateMutationField: false,
         isPgUpsertMutationField: true,
+        determineUpsertConstraint,
       }
     ),
   };
